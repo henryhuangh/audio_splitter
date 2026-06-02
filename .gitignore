@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+web/dist/
+
+# Local audio inputs and generated stems
+input/*
+!input/.gitkeep
+web/public/stems/*
+!web/public/stems/.gitkeep
+
+# OS/editor noise
+.DS_Store
