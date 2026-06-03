@@ -22,6 +22,7 @@ if sys.version_info < (3, 11) or sys.version_info >= (3, 12):
 # SAM-Audio's DAC/VAE path can hit Conv1d kernels that MPS does not support.
 # PyTorch reads this before import time, though this script defaults to CPU below.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torchaudio
@@ -144,6 +145,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing stem files.",
     )
+    parser.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Process audio in chunks of this length to limit GPU memory. "
+            "Defaults to 30 on CUDA, 0 (full file) elsewhere."
+        ),
+    )
+    parser.add_argument(
+        "--overlap-seconds",
+        type=float,
+        default=1.0,
+        metavar="SEC",
+        help="Crossfade overlap between chunks. Default: 1.0",
+    )
     return parser.parse_args()
 
 
@@ -174,6 +192,71 @@ def clear_device_cache(device: torch.device) -> None:
 
 def is_mps_out_of_memory(exc: RuntimeError) -> bool:
     return "mps" in str(exc).lower() and "out of memory" in str(exc).lower()
+
+
+def is_cuda_out_of_memory(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return "out of memory" in message and ("cuda" in message or "cudamalloc" in message)
+
+
+def resolve_chunk_seconds(requested: float | None, device: torch.device) -> float:
+    if requested is not None:
+        return max(0.0, requested)
+    if device.type == "cuda":
+        return 30.0
+    return 0.0
+
+
+def load_mono_waveform(audio_path: Path, sample_rate: int) -> torch.Tensor:
+    waveform, loaded_sample_rate = torchaudio.load(str(audio_path))
+    if loaded_sample_rate != sample_rate:
+        waveform = torchaudio.functional.resample(
+            waveform,
+            orig_freq=loaded_sample_rate,
+            new_freq=sample_rate,
+        )
+    return as_channels_first(waveform.mean(dim=0, keepdim=True))
+
+
+def iter_audio_chunks(
+    waveform: torch.Tensor,
+    chunk_samples: int,
+    overlap_samples: int,
+) -> list[torch.Tensor]:
+    total_samples = waveform.shape[-1]
+    if total_samples <= chunk_samples:
+        return [waveform]
+
+    step = max(1, chunk_samples - overlap_samples)
+    chunks: list[torch.Tensor] = []
+    for start in range(0, total_samples, step):
+        end = min(start + chunk_samples, total_samples)
+        chunks.append(waveform[..., start:end].contiguous())
+        if end >= total_samples:
+            break
+    return chunks
+
+
+def crossfade_concat(chunks: list[torch.Tensor], overlap_samples: int) -> torch.Tensor:
+    if not chunks:
+        raise ValueError("Expected at least one audio chunk.")
+    if len(chunks) == 1 or overlap_samples <= 0:
+        return torch.cat(chunks, dim=-1)
+
+    result = chunks[0]
+    fade_out = torch.linspace(1.0, 0.0, overlap_samples)
+    fade_in = 1.0 - fade_out
+    for chunk in chunks[1:]:
+        overlap = min(overlap_samples, result.shape[-1], chunk.shape[-1])
+        if overlap <= 1:
+            result = torch.cat([result, chunk], dim=-1)
+            continue
+
+        tail = result[..., -overlap:]
+        head = chunk[..., :overlap]
+        blended = tail * fade_out[:overlap] + head * fade_in[:overlap]
+        result = torch.cat([result[..., :-overlap], blended, chunk[..., overlap:]], dim=-1)
+    return result.contiguous()
 
 
 def resolve_model_path(model_arg: str) -> str:
@@ -297,17 +380,17 @@ def save_wav(path: Path, waveform: torch.Tensor, sample_rate: int, normalize: bo
     torchaudio.save(str(path), audio, sample_rate)
 
 
-def separate_channel(
+def separate_waveform(
     *,
     model: SAMAudio,
     processor: SAMAudioProcessor,
-    audio_path: Path,
+    waveform: torch.Tensor,
     prompt: str,
     device: torch.device,
     predict_spans: bool,
     reranking_candidates: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    batch = processor(audios=[str(audio_path)], descriptions=[prompt])
+    batch = processor(audios=[waveform], descriptions=[prompt])
     if hasattr(batch, "to"):
         batch = batch.to(device)
 
@@ -323,6 +406,71 @@ def separate_channel(
     del batch, result
     clear_device_cache(device)
     return target, residual
+
+
+def separate_channel(
+    *,
+    model: SAMAudio,
+    processor: SAMAudioProcessor,
+    audio_path: Path,
+    prompt: str,
+    device: torch.device,
+    predict_spans: bool,
+    reranking_candidates: int,
+    sample_rate: int,
+    chunk_seconds: float,
+    overlap_seconds: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if chunk_seconds <= 0:
+        return separate_waveform(
+            model=model,
+            processor=processor,
+            waveform=load_mono_waveform(audio_path, sample_rate),
+            prompt=prompt,
+            device=device,
+            predict_spans=predict_spans,
+            reranking_candidates=reranking_candidates,
+        )
+
+    waveform = load_mono_waveform(audio_path, sample_rate)
+    chunk_samples = max(1, int(chunk_seconds * sample_rate))
+    overlap_samples = max(0, int(overlap_seconds * sample_rate))
+    chunks = iter_audio_chunks(waveform, chunk_samples, overlap_samples)
+    if len(chunks) == 1:
+        return separate_waveform(
+            model=model,
+            processor=processor,
+            waveform=chunks[0],
+            prompt=prompt,
+            device=device,
+            predict_spans=predict_spans,
+            reranking_candidates=reranking_candidates,
+        )
+
+    print(
+        f"  Processing {len(chunks)} chunks "
+        f"({chunk_seconds:.1f}s each, {overlap_seconds:.1f}s overlap)..."
+    )
+    target_chunks: list[torch.Tensor] = []
+    residual_chunks: list[torch.Tensor] = []
+    for index, chunk in enumerate(chunks, start=1):
+        print(f"    chunk {index}/{len(chunks)}")
+        target, residual = separate_waveform(
+            model=model,
+            processor=processor,
+            waveform=chunk,
+            prompt=prompt,
+            device=device,
+            predict_spans=predict_spans,
+            reranking_candidates=reranking_candidates,
+        )
+        target_chunks.append(target)
+        residual_chunks.append(residual)
+
+    return (
+        crossfade_concat(target_chunks, overlap_samples),
+        crossfade_concat(residual_chunks, overlap_samples),
+    )
 
 
 def main() -> None:
@@ -368,6 +516,13 @@ def main() -> None:
         else:
             raise
     sample_rate = get_sample_rate(processor)
+    chunk_seconds = resolve_chunk_seconds(args.chunk_seconds, device)
+    overlap_seconds = max(0.0, args.overlap_seconds)
+    if chunk_seconds > 0:
+        print(
+            f"Using chunked separation: {chunk_seconds:.1f}s chunks "
+            f"with {overlap_seconds:.1f}s overlap."
+        )
 
     manifest_channels = []
     current_audio_path = input_path
@@ -386,6 +541,9 @@ def main() -> None:
                     device=device,
                     predict_spans=args.predict_spans,
                     reranking_candidates=args.reranking_candidates,
+                    sample_rate=sample_rate,
+                    chunk_seconds=chunk_seconds,
+                    overlap_seconds=overlap_seconds,
                 )
             except RuntimeError as exc:
                 if device.type == "mps" and is_mps_out_of_memory(exc):
@@ -396,6 +554,12 @@ def main() -> None:
                         "As a last resort, start Python with "
                         "`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`, but that can "
                         "make macOS unstable if physical memory is exhausted."
+                    ) from exc
+                if device.type == "cuda" and is_cuda_out_of_memory(exc):
+                    raise SystemExit(
+                        "CUDA ran out of memory during separation. Retry with a "
+                        "smaller `--chunk-seconds` value (for example 15), "
+                        "`--no-predict-spans`, or `--reranking-candidates 1`."
                     ) from exc
                 raise
 
