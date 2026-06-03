@@ -91,19 +91,12 @@ class StemChannel:
         return self.file_stem or re.sub(r"[^a-z0-9]+", "_", self.prompt.lower()).strip("_")
 
 
-PRIMARY_CHANNELS = [
+CHANNELS = [
     StemChannel(
         "Vocals",
         "lead and backing vocals including sung or spoken human voice",
         "vocals",
     ),
-    StemChannel(
-        "Drums / Beat",
-        "complete drum kit, beat, rhythm track, percussion groove, kick, snare, clap, hi-hat, cymbals, and drum loops",
-        "drum_beat",
-    ),
-]
-DRUM_DETAIL_CHANNELS = [
     StemChannel(
         "Downbeat",
         "downbeat impact accent on the first beat of each bar",
@@ -126,8 +119,8 @@ OTHER_CHANNEL = StemChannel("Other", "other remaining audio after vocals and dru
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Split a song into final vocals, residual other, and drum-detail stems "
-            "using an intermediate drum/beat stem."
+            "Split a song into vocals, drum-detail stems, and residual other "
+            "with SAM-Audio residual chaining."
         )
     )
     parser.add_argument(
@@ -636,7 +629,7 @@ def main() -> None:
         raise SystemExit(f"Input file does not exist: {input_path}")
     intermediate_output_paths = [output_dir / "drum_beat.wav"]
     if output_dir.exists() and not args.overwrite:
-        output_channels = [PRIMARY_CHANNELS[0], OTHER_CHANNEL, *DRUM_DETAIL_CHANNELS]
+        output_channels = [*CHANNELS, OTHER_CHANNEL]
         existing = [
             *[output_dir / f"{channel.slug}.wav" for channel in output_channels],
             *intermediate_output_paths,
@@ -691,16 +684,12 @@ def main() -> None:
 
     manifest_channels = []
     current_audio_path = input_path
-    drum_audio_path: Path | None = None
 
     with tempfile.TemporaryDirectory(prefix="sam-audio-residuals-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
 
-        for index, channel in enumerate(PRIMARY_CHANNELS, start=1):
-            print(
-                f"[primary {index}/{len(PRIMARY_CHANNELS)}] "
-                f"Separating {channel.label} ({channel.prompt!r})..."
-            )
+        for index, channel in enumerate(CHANNELS, start=1):
+            print(f"[{index}/{len(CHANNELS)}] Separating {channel.label} ({channel.prompt!r})...")
             try:
                 target, residual = separate_channel(
                     model=model,
@@ -719,13 +708,9 @@ def main() -> None:
                 handle_separation_runtime_error(exc, device)
 
             target_audio = as_channels_first(target)
-            if channel.slug == "drum_beat":
-                drum_audio_path = temp_dir / f"{index:02d}_{channel.slug}.wav"
-                save_wav(drum_audio_path, target_audio, sample_rate, normalize=False)
-            else:
-                output_path = output_dir / f"{channel.slug}.wav"
-                save_public_wav(output_path, target_audio, sample_rate)
-                append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
+            output_path = output_dir / f"{channel.slug}.wav"
+            save_public_wav(output_path, target_audio, sample_rate)
+            append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
 
             residual_path = temp_dir / f"{index:02d}_{channel.slug}_residual.wav"
             save_wav(residual_path, residual, sample_rate, normalize=False)
@@ -740,43 +725,10 @@ def main() -> None:
         del other_audio
         clear_device_cache(device)
 
-        if drum_audio_path is None:
-            raise SystemExit("Could not isolate drum/beat stem for drum-detail separation.")
-
-        for index, channel in enumerate(DRUM_DETAIL_CHANNELS, start=1):
-            print(
-                f"[drum detail {index}/{len(DRUM_DETAIL_CHANNELS)}] "
-                f"Separating {channel.label} from drum/beat ({channel.prompt!r})..."
-            )
-            try:
-                target, residual = separate_channel(
-                    model=model,
-                    processor=processor,
-                    audio_path=drum_audio_path,
-                    prompt=channel.prompt,
-                    device=device,
-                    predict_spans=args.predict_spans,
-                    reranking_candidates=args.reranking_candidates,
-                    sample_rate=sample_rate,
-                    chunk_seconds=chunk_seconds,
-                    overlap_seconds=overlap_seconds,
-                    max_duration_seconds=max_duration_seconds,
-                )
-            except RuntimeError as exc:
-                handle_separation_runtime_error(exc, device)
-
-            target_audio = as_channels_first(target)
-            output_path = output_dir / f"{channel.slug}.wav"
-            save_public_wav(output_path, target_audio, sample_rate)
-            append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
-
-            del target, residual, target_audio
-            clear_device_cache(device)
-
     manifest = {
         "model": model_name_or_path,
         "source": str(input_path),
-        "strategy": "primary-residual-chaining-with-drum-detail-chaining",
+        "strategy": "residual-chaining",
         "sampleRate": sample_rate,
         "channels": manifest_channels,
     }
