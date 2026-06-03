@@ -91,7 +91,7 @@ class DrumChannel:
 
 
 CHANNELS = [
-    DrumChannel("Bass drum", "bass drum"),
+    DrumChannel("Kick drum", "kick drum"),
     DrumChannel("Snare drum", "snare drum"),
     DrumChannel("Hi-hat", "hi-hat"),
     DrumChannel("Ride cymbal", "ride cymbal"),
@@ -99,11 +99,12 @@ CHANNELS = [
     DrumChannel("High tom", "high tom"),
     DrumChannel("Mid tom", "mid tom"),
 ]
+OTHER_CHANNEL = DrumChannel("Other", "other non-percussion audio")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Split a song into drum-kit channels with SAM-Audio residual chaining."
+        description="Split a song into drum-kit channels plus an other stem with SAM-Audio residual chaining."
     )
     parser.add_argument(
         "--input",
@@ -384,6 +385,24 @@ def save_wav(path: Path, waveform: torch.Tensor, sample_rate: int, normalize: bo
     torchaudio.save(str(path), audio, sample_rate)
 
 
+def append_manifest_channel(
+    manifest_channels: list[dict[str, Any]],
+    channel: DrumChannel,
+    waveform: torch.Tensor,
+    sample_rate: int,
+) -> None:
+    manifest_channels.append(
+        {
+            "id": channel.slug,
+            "label": channel.label,
+            "prompt": channel.prompt,
+            "file": f"/stems/{channel.slug}.wav",
+            "duration": waveform.shape[-1] / sample_rate,
+            "sampleRate": sample_rate,
+        }
+    )
+
+
 def separate_waveform(
     *,
     model: SAMAudio,
@@ -535,7 +554,7 @@ def main() -> None:
     if not input_path.exists():
         raise SystemExit(f"Input file does not exist: {input_path}")
     if output_dir.exists() and not args.overwrite:
-        existing = [output_dir / f"{channel.slug}.wav" for channel in CHANNELS]
+        existing = [output_dir / f"{channel.slug}.wav" for channel in [*CHANNELS, OTHER_CHANNEL]]
         if any(path.exists() for path in existing):
             raise SystemExit(
                 f"Stem files already exist in {output_dir}. "
@@ -621,23 +640,20 @@ def main() -> None:
             output_path = output_dir / f"{channel.slug}.wav"
             save_wav(output_path, target_audio, sample_rate, normalize=True)
 
-            duration_seconds = target_audio.shape[-1] / sample_rate
-            manifest_channels.append(
-                {
-                    "id": channel.slug,
-                    "label": channel.label,
-                    "prompt": channel.prompt,
-                    "file": f"/stems/{channel.slug}.wav",
-                    "duration": duration_seconds,
-                    "sampleRate": sample_rate,
-                }
-            )
+            append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
 
             residual_path = temp_dir / f"{index:02d}_{channel.slug}_residual.wav"
             save_wav(residual_path, residual, sample_rate, normalize=False)
             current_audio_path = residual_path
             del target, residual, target_audio
             clear_device_cache(device)
+
+        other_audio = load_mono_waveform(current_audio_path, sample_rate)
+        other_output_path = output_dir / f"{OTHER_CHANNEL.slug}.wav"
+        save_wav(other_output_path, other_audio, sample_rate, normalize=True)
+        append_manifest_channel(manifest_channels, OTHER_CHANNEL, other_audio, sample_rate)
+        del other_audio
+        clear_device_cache(device)
 
     manifest = {
         "model": model_name_or_path,

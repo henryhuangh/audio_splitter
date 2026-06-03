@@ -1,18 +1,20 @@
 # SAM-Audio Drum Splitter + Multitrack Player
 
-Split an input song into seven drum-kit channels with SAM-Audio, then play the stems in a browser mixer.
+Split an input song into drum-kit channels and an `other` stem with SAM-Audio, then play the stems in a browser mixer.
 
 ## Channels
 
 The separator extracts these prompts in order, feeding each pass the residual audio from the previous pass:
 
-1. Bass drum
+1. Kick drum
 2. Snare drum
 3. Hi-hat
 4. Ride cymbal
 5. Crash cymbal
 6. High tom
 7. Mid tom
+
+After the drum passes, the final residual is written as `other.wav` for non-percussion audio such as vocals and melodic instruments.
 
 ## Project Layout
 
@@ -61,11 +63,11 @@ The separator extracts these prompts in order, feeding each pass the residual au
    npm run dev
    ```
 
-Open the Vite URL in your browser and use the mixer to mute, solo, and select active drum channels while the song plays.
+Open the Vite URL in your browser and use the mixer to mute, solo, and select active channels while the song plays.
 
 ## Notes
 
-SAM-Audio is a large model. On a Mac without CUDA, local inference can be slow, especially with seven chained passes. The script will try MPS first when available, then CPU.
+SAM-Audio is a large model. On a Mac without CUDA, local inference can be slow, especially with seven chained drum passes. The script will try MPS first when available, then CPU.
 
 The upstream SAM-Audio package currently has rough edges on macOS because its
 `perception-models` dependency requires `decord`, which does not ship compatible

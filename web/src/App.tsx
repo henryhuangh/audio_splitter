@@ -138,10 +138,10 @@ function App() {
     <main className="app">
       <section className="hero">
         <div>
-          <p className="eyebrow">SAM-Audio Drum Splitter</p>
-          <h1>Seven-channel drum mixer</h1>
+          <p className="eyebrow">SAM-Audio Stem Splitter</p>
+          <h1>Drum and other-stem mixer</h1>
           <p className="subtitle">
-            Play SAM-Audio stems in sync, highlight channels as they sound, and select the drum parts you want
+            Play SAM-Audio stems in sync, highlight channels as they sound, and select the parts you want
             active while the track is moving.
           </p>
         </div>
@@ -191,7 +191,7 @@ function App() {
             </button>
           </section>
 
-          <section className="mixer" aria-label="Drum channels">
+          <section className="mixer" aria-label="Stem channels">
             {player.channels.map((channel) => (
               <ChannelStrip
                 key={channel.id}
