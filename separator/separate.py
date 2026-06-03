@@ -131,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--predict-spans",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Let SAM-Audio predict useful temporal spans for each prompt.",
+        default=False,
+        help="Let SAM-Audio predict useful temporal spans for each prompt. Costs much more memory.",
     )
     parser.add_argument(
         "--reranking-candidates",
@@ -347,6 +347,10 @@ def get_audio_field(result: Any, name: str) -> torch.Tensor:
         value = result[name]
     else:
         raise AttributeError(f"SAM-Audio result did not include {name!r}.")
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError(f"SAM-Audio result field {name!r} had {len(value)} batch items.")
+        value = value[0]
     if not isinstance(value, torch.Tensor):
         value = torch.as_tensor(value)
     return value
