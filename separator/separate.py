@@ -126,8 +126,8 @@ OTHER_CHANNEL = StemChannel("Other", "other remaining audio after vocals and dru
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Split a song into vocals, drum/beat, residual other, and drum-detail stems "
-            "with SAM-Audio residual chaining."
+            "Split a song into final vocals, residual other, and drum-detail stems "
+            "using an intermediate drum/beat stem."
         )
     )
     parser.add_argument(
@@ -169,6 +169,11 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Overwrite existing stem files.",
+    )
+    parser.add_argument(
+        "--test-minute",
+        action="store_true",
+        help="Only process the first 60 seconds for a quick test run.",
     )
     parser.add_argument(
         "--chunk-seconds",
@@ -232,7 +237,11 @@ def resolve_chunk_seconds(requested: float | None, device: torch.device) -> floa
     return 0.0
 
 
-def load_mono_waveform(audio_path: Path, sample_rate: int) -> torch.Tensor:
+def load_mono_waveform(
+    audio_path: Path,
+    sample_rate: int,
+    max_duration_seconds: float | None = None,
+) -> torch.Tensor:
     waveform, loaded_sample_rate = torchaudio.load(str(audio_path))
     if loaded_sample_rate != sample_rate:
         waveform = torchaudio.functional.resample(
@@ -240,6 +249,9 @@ def load_mono_waveform(audio_path: Path, sample_rate: int) -> torch.Tensor:
             orig_freq=loaded_sample_rate,
             new_freq=sample_rate,
         )
+    if max_duration_seconds is not None:
+        max_samples = max(1, int(max_duration_seconds * sample_rate))
+        waveform = waveform[..., :max_samples]
     return as_channels_first(waveform.mean(dim=0, keepdim=True))
 
 
@@ -567,8 +579,9 @@ def separate_channel(
     sample_rate: int,
     chunk_seconds: float,
     overlap_seconds: float,
+    max_duration_seconds: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    waveform = load_mono_waveform(audio_path, sample_rate)
+    waveform = load_mono_waveform(audio_path, sample_rate, max_duration_seconds)
     if chunk_seconds <= 0:
         return separate_waveform(
             model=model,
@@ -621,9 +634,13 @@ def main() -> None:
 
     if not input_path.exists():
         raise SystemExit(f"Input file does not exist: {input_path}")
+    intermediate_output_paths = [output_dir / "drum_beat.wav"]
     if output_dir.exists() and not args.overwrite:
-        output_channels = [*PRIMARY_CHANNELS, OTHER_CHANNEL, *DRUM_DETAIL_CHANNELS]
-        existing = [output_dir / f"{channel.slug}.wav" for channel in output_channels]
+        output_channels = [PRIMARY_CHANNELS[0], OTHER_CHANNEL, *DRUM_DETAIL_CHANNELS]
+        existing = [
+            *[output_dir / f"{channel.slug}.wav" for channel in output_channels],
+            *intermediate_output_paths,
+        ]
         if any(path.exists() for path in existing):
             raise SystemExit(
                 f"Stem files already exist in {output_dir}. "
@@ -631,6 +648,9 @@ def main() -> None:
             )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.overwrite:
+        for path in intermediate_output_paths:
+            path.unlink(missing_ok=True)
     device = choose_device(args.device)
     model_name_or_path = resolve_model_path(args.model)
     print(f"Loading {model_name_or_path} on {device}...")
@@ -660,6 +680,9 @@ def main() -> None:
     sample_rate = get_sample_rate(processor)
     chunk_seconds = resolve_chunk_seconds(args.chunk_seconds, device)
     overlap_seconds = max(0.0, args.overlap_seconds)
+    max_duration_seconds = 60.0 if args.test_minute else None
+    if max_duration_seconds is not None:
+        print("Test mode: only processing the first 60 seconds.")
     if chunk_seconds > 0:
         print(
             f"Using chunked separation: {chunk_seconds:.1f}s chunks "
@@ -690,19 +713,19 @@ def main() -> None:
                     sample_rate=sample_rate,
                     chunk_seconds=chunk_seconds,
                     overlap_seconds=overlap_seconds,
+                    max_duration_seconds=max_duration_seconds,
                 )
             except RuntimeError as exc:
                 handle_separation_runtime_error(exc, device)
 
             target_audio = as_channels_first(target)
-            output_path = output_dir / f"{channel.slug}.wav"
-            save_public_wav(output_path, target_audio, sample_rate)
-
-            append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
-
             if channel.slug == "drum_beat":
                 drum_audio_path = temp_dir / f"{index:02d}_{channel.slug}.wav"
                 save_wav(drum_audio_path, target_audio, sample_rate, normalize=False)
+            else:
+                output_path = output_dir / f"{channel.slug}.wav"
+                save_public_wav(output_path, target_audio, sample_rate)
+                append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
 
             residual_path = temp_dir / f"{index:02d}_{channel.slug}_residual.wav"
             save_wav(residual_path, residual, sample_rate, normalize=False)
@@ -710,7 +733,7 @@ def main() -> None:
             del target, residual, target_audio
             clear_device_cache(device)
 
-        other_audio = load_mono_waveform(current_audio_path, sample_rate)
+        other_audio = load_mono_waveform(current_audio_path, sample_rate, max_duration_seconds)
         other_output_path = output_dir / f"{OTHER_CHANNEL.slug}.wav"
         save_public_wav(other_output_path, other_audio, sample_rate)
         append_manifest_channel(manifest_channels, OTHER_CHANNEL, other_audio, sample_rate)
@@ -720,7 +743,6 @@ def main() -> None:
         if drum_audio_path is None:
             raise SystemExit("Could not isolate drum/beat stem for drum-detail separation.")
 
-        current_drum_audio_path = drum_audio_path
         for index, channel in enumerate(DRUM_DETAIL_CHANNELS, start=1):
             print(
                 f"[drum detail {index}/{len(DRUM_DETAIL_CHANNELS)}] "
@@ -730,7 +752,7 @@ def main() -> None:
                 target, residual = separate_channel(
                     model=model,
                     processor=processor,
-                    audio_path=current_drum_audio_path,
+                    audio_path=drum_audio_path,
                     prompt=channel.prompt,
                     device=device,
                     predict_spans=args.predict_spans,
@@ -738,6 +760,7 @@ def main() -> None:
                     sample_rate=sample_rate,
                     chunk_seconds=chunk_seconds,
                     overlap_seconds=overlap_seconds,
+                    max_duration_seconds=max_duration_seconds,
                 )
             except RuntimeError as exc:
                 handle_separation_runtime_error(exc, device)
@@ -747,9 +770,6 @@ def main() -> None:
             save_public_wav(output_path, target_audio, sample_rate)
             append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
 
-            residual_path = temp_dir / f"drum_detail_{index:02d}_{channel.slug}_residual.wav"
-            save_wav(residual_path, residual, sample_rate, normalize=False)
-            current_drum_audio_path = residual_path
             del target, residual, target_audio
             clear_device_cache(device)
 
