@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
         metavar="SEC",
         help=(
             "Process audio in chunks of this length to limit GPU memory. "
-            "Defaults to 30 on CUDA, 0 (full file) elsewhere."
+            "Defaults to 10 on CUDA, 0 (full file) elsewhere."
         ),
     )
     parser.add_argument(
@@ -203,7 +203,7 @@ def resolve_chunk_seconds(requested: float | None, device: torch.device) -> floa
     if requested is not None:
         return max(0.0, requested)
     if device.type == "cuda":
-        return 30.0
+        return 10.0
     return 0.0
 
 
@@ -408,11 +408,11 @@ def separate_waveform(
     return target, residual
 
 
-def separate_channel(
+def separate_loaded_waveform_chunked(
     *,
     model: SAMAudio,
     processor: SAMAudioProcessor,
-    audio_path: Path,
+    waveform: torch.Tensor,
     prompt: str,
     device: torch.device,
     predict_spans: bool,
@@ -421,20 +421,11 @@ def separate_channel(
     chunk_seconds: float,
     overlap_seconds: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if chunk_seconds <= 0:
-        return separate_waveform(
-            model=model,
-            processor=processor,
-            waveform=load_mono_waveform(audio_path, sample_rate),
-            prompt=prompt,
-            device=device,
-            predict_spans=predict_spans,
-            reranking_candidates=reranking_candidates,
-        )
-
-    waveform = load_mono_waveform(audio_path, sample_rate)
     chunk_samples = max(1, int(chunk_seconds * sample_rate))
     overlap_samples = max(0, int(overlap_seconds * sample_rate))
+    if overlap_samples >= chunk_samples:
+        overlap_samples = max(0, chunk_samples // 2)
+
     chunks = iter_audio_chunks(waveform, chunk_samples, overlap_samples)
     if len(chunks) == 1:
         return separate_waveform(
@@ -449,7 +440,7 @@ def separate_channel(
 
     print(
         f"  Processing {len(chunks)} chunks "
-        f"({chunk_seconds:.1f}s each, {overlap_seconds:.1f}s overlap)..."
+        f"({chunk_seconds:.1f}s each, {overlap_samples / sample_rate:.1f}s overlap)..."
     )
     target_chunks: list[torch.Tensor] = []
     residual_chunks: list[torch.Tensor] = []
@@ -471,6 +462,65 @@ def separate_channel(
         crossfade_concat(target_chunks, overlap_samples),
         crossfade_concat(residual_chunks, overlap_samples),
     )
+
+
+def separate_channel(
+    *,
+    model: SAMAudio,
+    processor: SAMAudioProcessor,
+    audio_path: Path,
+    prompt: str,
+    device: torch.device,
+    predict_spans: bool,
+    reranking_candidates: int,
+    sample_rate: int,
+    chunk_seconds: float,
+    overlap_seconds: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    waveform = load_mono_waveform(audio_path, sample_rate)
+    if chunk_seconds <= 0:
+        return separate_waveform(
+            model=model,
+            processor=processor,
+            waveform=waveform,
+            prompt=prompt,
+            device=device,
+            predict_spans=predict_spans,
+            reranking_candidates=reranking_candidates,
+        )
+
+    current_chunk_seconds = chunk_seconds
+    min_cuda_chunk_seconds = 2.0
+    while True:
+        try:
+            return separate_loaded_waveform_chunked(
+                model=model,
+                processor=processor,
+                waveform=waveform,
+                prompt=prompt,
+                device=device,
+                predict_spans=predict_spans,
+                reranking_candidates=reranking_candidates,
+                sample_rate=sample_rate,
+                chunk_seconds=current_chunk_seconds,
+                overlap_seconds=overlap_seconds,
+            )
+        except RuntimeError as exc:
+            can_retry_cuda = (
+                device.type == "cuda"
+                and is_cuda_out_of_memory(exc)
+                and current_chunk_seconds > min_cuda_chunk_seconds
+            )
+            if not can_retry_cuda:
+                raise
+
+            clear_device_cache(device)
+            next_chunk_seconds = max(min_cuda_chunk_seconds, current_chunk_seconds / 2)
+            print(
+                "  CUDA ran out of memory; retrying this channel with "
+                f"{next_chunk_seconds:.1f}s chunks."
+            )
+            current_chunk_seconds = next_chunk_seconds
 
 
 def main() -> None:
