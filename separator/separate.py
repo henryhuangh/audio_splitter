@@ -84,23 +84,51 @@ MODEL_ID = "facebook/sam-audio-large"
 class StemChannel:
     label: str
     prompt: str
+    file_stem: str
 
     @property
     def slug(self) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", self.prompt.lower()).strip("_")
+        return self.file_stem or re.sub(r"[^a-z0-9]+", "_", self.prompt.lower()).strip("_")
 
 
-CHANNELS = [
-    StemChannel("Downbeat", "downbeat impact accent on the first beat of each bar"),
-    StemChannel("Kick", "deep kick drum pulse with strong low-frequency attack"),
-    StemChannel("Snare / Clap", "snare drum or hand clap backbeat accent"),
+PRIMARY_CHANNELS = [
+    StemChannel(
+        "Vocals",
+        "lead and backing vocals including sung or spoken human voice",
+        "vocals",
+    ),
+    StemChannel(
+        "Drums / Beat",
+        "complete drum kit, beat, rhythm track, percussion groove, kick, snare, clap, hi-hat, cymbals, and drum loops",
+        "drum_beat",
+    ),
 ]
-OTHER_CHANNEL = StemChannel("Other", "other remaining audio")
+DRUM_DETAIL_CHANNELS = [
+    StemChannel(
+        "Downbeat",
+        "downbeat impact accent on the first beat of each bar",
+        "downbeat",
+    ),
+    StemChannel(
+        "Kick",
+        "deep kick drum pulse with strong low-frequency attack",
+        "kick",
+    ),
+    StemChannel(
+        "Snare / Clap",
+        "snare drum or hand clap backbeat accent",
+        "snare_clap",
+    ),
+]
+OTHER_CHANNEL = StemChannel("Other", "other remaining audio after vocals and drums", "other")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Split a song into rhythmic action stems plus an other stem with SAM-Audio residual chaining."
+        description=(
+            "Split a song into vocals, drum/beat, residual other, and drum-detail stems "
+            "with SAM-Audio residual chaining."
+        )
     )
     parser.add_argument(
         "--input",
@@ -424,6 +452,25 @@ def append_manifest_channel(
     )
 
 
+def handle_separation_runtime_error(exc: RuntimeError, device: torch.device) -> None:
+    if device.type == "mps" and is_mps_out_of_memory(exc):
+        raise SystemExit(
+            "MPS ran out of memory during separation. Retry with "
+            "`--device cpu` for the most reliable run, or try "
+            "`--no-predict-spans` to reduce peak memory on MPS. "
+            "As a last resort, start Python with "
+            "`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`, but that can "
+            "make macOS unstable if physical memory is exhausted."
+        ) from exc
+    if device.type == "cuda" and is_cuda_out_of_memory(exc):
+        raise SystemExit(
+            "CUDA ran out of memory during separation. Retry with a "
+            "smaller `--chunk-seconds` value (for example 15), "
+            "`--no-predict-spans`, or `--reranking-candidates 1`."
+        ) from exc
+    raise exc
+
+
 def separate_waveform(
     *,
     model: SAMAudio,
@@ -575,7 +622,8 @@ def main() -> None:
     if not input_path.exists():
         raise SystemExit(f"Input file does not exist: {input_path}")
     if output_dir.exists() and not args.overwrite:
-        existing = [output_dir / f"{channel.slug}.wav" for channel in [*CHANNELS, OTHER_CHANNEL]]
+        output_channels = [*PRIMARY_CHANNELS, OTHER_CHANNEL, *DRUM_DETAIL_CHANNELS]
+        existing = [output_dir / f"{channel.slug}.wav" for channel in output_channels]
         if any(path.exists() for path in existing):
             raise SystemExit(
                 f"Stem files already exist in {output_dir}. "
@@ -620,12 +668,16 @@ def main() -> None:
 
     manifest_channels = []
     current_audio_path = input_path
+    drum_audio_path: Path | None = None
 
     with tempfile.TemporaryDirectory(prefix="sam-audio-residuals-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
 
-        for index, channel in enumerate(CHANNELS, start=1):
-            print(f"[{index}/{len(CHANNELS)}] Separating {channel.label} ({channel.prompt!r})...")
+        for index, channel in enumerate(PRIMARY_CHANNELS, start=1):
+            print(
+                f"[primary {index}/{len(PRIMARY_CHANNELS)}] "
+                f"Separating {channel.label} ({channel.prompt!r})..."
+            )
             try:
                 target, residual = separate_channel(
                     model=model,
@@ -640,28 +692,17 @@ def main() -> None:
                     overlap_seconds=overlap_seconds,
                 )
             except RuntimeError as exc:
-                if device.type == "mps" and is_mps_out_of_memory(exc):
-                    raise SystemExit(
-                        "MPS ran out of memory during separation. Retry with "
-                        "`--device cpu` for the most reliable run, or try "
-                        "`--no-predict-spans` to reduce peak memory on MPS. "
-                        "As a last resort, start Python with "
-                        "`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`, but that can "
-                        "make macOS unstable if physical memory is exhausted."
-                    ) from exc
-                if device.type == "cuda" and is_cuda_out_of_memory(exc):
-                    raise SystemExit(
-                        "CUDA ran out of memory during separation. Retry with a "
-                        "smaller `--chunk-seconds` value (for example 15), "
-                        "`--no-predict-spans`, or `--reranking-candidates 1`."
-                    ) from exc
-                raise
+                handle_separation_runtime_error(exc, device)
 
             target_audio = as_channels_first(target)
             output_path = output_dir / f"{channel.slug}.wav"
             save_public_wav(output_path, target_audio, sample_rate)
 
             append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
+
+            if channel.slug == "drum_beat":
+                drum_audio_path = temp_dir / f"{index:02d}_{channel.slug}.wav"
+                save_wav(drum_audio_path, target_audio, sample_rate, normalize=False)
 
             residual_path = temp_dir / f"{index:02d}_{channel.slug}_residual.wav"
             save_wav(residual_path, residual, sample_rate, normalize=False)
@@ -676,10 +717,46 @@ def main() -> None:
         del other_audio
         clear_device_cache(device)
 
+        if drum_audio_path is None:
+            raise SystemExit("Could not isolate drum/beat stem for drum-detail separation.")
+
+        current_drum_audio_path = drum_audio_path
+        for index, channel in enumerate(DRUM_DETAIL_CHANNELS, start=1):
+            print(
+                f"[drum detail {index}/{len(DRUM_DETAIL_CHANNELS)}] "
+                f"Separating {channel.label} from drum/beat ({channel.prompt!r})..."
+            )
+            try:
+                target, residual = separate_channel(
+                    model=model,
+                    processor=processor,
+                    audio_path=current_drum_audio_path,
+                    prompt=channel.prompt,
+                    device=device,
+                    predict_spans=args.predict_spans,
+                    reranking_candidates=args.reranking_candidates,
+                    sample_rate=sample_rate,
+                    chunk_seconds=chunk_seconds,
+                    overlap_seconds=overlap_seconds,
+                )
+            except RuntimeError as exc:
+                handle_separation_runtime_error(exc, device)
+
+            target_audio = as_channels_first(target)
+            output_path = output_dir / f"{channel.slug}.wav"
+            save_public_wav(output_path, target_audio, sample_rate)
+            append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
+
+            residual_path = temp_dir / f"drum_detail_{index:02d}_{channel.slug}_residual.wav"
+            save_wav(residual_path, residual, sample_rate, normalize=False)
+            current_drum_audio_path = residual_path
+            del target, residual, target_audio
+            clear_device_cache(device)
+
     manifest = {
         "model": model_name_or_path,
         "source": str(input_path),
-        "strategy": "residual-chaining",
+        "strategy": "primary-residual-chaining-with-drum-detail-chaining",
         "sampleRate": sample_rate,
         "channels": manifest_channels,
     }

@@ -1,16 +1,17 @@
-# SAM-Audio Rhythm Splitter + Multitrack Player
+# SAM-Audio Vocal/Rhythm Splitter + Multitrack Player
 
-Split an input song into rhythmic action stems and an `other` stem with SAM-Audio, then play the stems in a browser mixer.
+Split an input song into vocal and rhythmic action stems plus an `other` stem with SAM-Audio, then play the stems in a browser mixer.
 
 ## Channels
 
 The separator extracts these prompts in order, feeding each pass the residual audio from the previous pass:
 
-1. Downbeat - `downbeat impact accent on the first beat of each bar`
-2. Kick - `deep kick drum pulse with strong low-frequency attack`
-3. Snare / Clap - `snare drum or hand clap backbeat accent`
+1. Vocals - `lead and backing vocals including sung or spoken human voice`
+2. Downbeat - `downbeat impact accent on the first beat of each bar`
+3. Kick - `deep kick drum pulse with strong low-frequency attack`
+4. Snare / Clap - `snare drum or hand clap backbeat accent`
 
-After the rhythmic passes, the final residual is written as `other.wav` for remaining audio such as vocals and melodic instruments.
+After the vocal and rhythmic passes, the final residual is written as `other.wav` for remaining audio such as melodic instruments and ambience.
 
 ## Project Layout
 
