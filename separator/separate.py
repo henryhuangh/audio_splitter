@@ -77,7 +77,7 @@ install_torchcodec_audio_decoder_compat()
 from sam_audio import SAMAudio, SAMAudioProcessor
 
 
-MODEL_ID = "facebook/sam-audio-small"
+MODEL_ID = "facebook/sam-audio-large"
 
 
 @dataclass(frozen=True)
@@ -204,7 +204,7 @@ def resolve_chunk_seconds(requested: float | None, device: torch.device) -> floa
     if requested is not None:
         return max(0.0, requested)
     if device.type == "cuda":
-        return 10.0
+        return 30.0
     return 0.0
 
 
