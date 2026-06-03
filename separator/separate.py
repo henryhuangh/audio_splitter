@@ -81,7 +81,7 @@ MODEL_ID = "facebook/sam-audio-large"
 
 
 @dataclass(frozen=True)
-class DrumChannel:
+class StemChannel:
     label: str
     prompt: str
 
@@ -91,20 +91,16 @@ class DrumChannel:
 
 
 CHANNELS = [
-    DrumChannel("Kick drum", "kick drum"),
-    DrumChannel("Snare drum", "snare drum"),
-    DrumChannel("Hi-hat", "hi-hat"),
-    DrumChannel("Ride cymbal", "ride cymbal"),
-    DrumChannel("Crash cymbal", "crash cymbal"),
-    DrumChannel("High tom", "high tom"),
-    DrumChannel("Mid tom", "mid tom"),
+    StemChannel("Downbeat", "downbeat impact accent on the first beat of each bar"),
+    StemChannel("Kick", "deep kick drum pulse with strong low-frequency attack"),
+    StemChannel("Snare / Clap", "snare drum or hand clap backbeat accent"),
 ]
-OTHER_CHANNEL = DrumChannel("Other", "other non-percussion audio")
+OTHER_CHANNEL = StemChannel("Other", "other remaining audio")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Split a song into drum-kit channels plus an other stem with SAM-Audio residual chaining."
+        description="Split a song into rhythmic action stems plus an other stem with SAM-Audio residual chaining."
     )
     parser.add_argument(
         "--input",
@@ -377,17 +373,42 @@ def peak_normalize(waveform: torch.Tensor, target_peak: float = 0.98) -> torch.T
     return waveform * (target_peak / peak)
 
 
-def save_wav(path: Path, waveform: torch.Tensor, sample_rate: int, normalize: bool) -> None:
+def save_wav(
+    path: Path,
+    waveform: torch.Tensor,
+    sample_rate: int,
+    normalize: bool,
+    *,
+    encoding: str | None = None,
+    bits_per_sample: int | None = None,
+) -> None:
     audio = as_channels_first(waveform)
     if normalize:
         audio = peak_normalize(audio)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(path), audio, sample_rate)
+    torchaudio.save(
+        str(path),
+        audio,
+        sample_rate,
+        encoding=encoding,
+        bits_per_sample=bits_per_sample,
+    )
+
+
+def save_public_wav(path: Path, waveform: torch.Tensor, sample_rate: int) -> None:
+    save_wav(
+        path,
+        waveform,
+        sample_rate,
+        normalize=True,
+        encoding="PCM_S",
+        bits_per_sample=16,
+    )
 
 
 def append_manifest_channel(
     manifest_channels: list[dict[str, Any]],
-    channel: DrumChannel,
+    channel: StemChannel,
     waveform: torch.Tensor,
     sample_rate: int,
 ) -> None:
@@ -638,7 +659,7 @@ def main() -> None:
 
             target_audio = as_channels_first(target)
             output_path = output_dir / f"{channel.slug}.wav"
-            save_wav(output_path, target_audio, sample_rate, normalize=True)
+            save_public_wav(output_path, target_audio, sample_rate)
 
             append_manifest_channel(manifest_channels, channel, target_audio, sample_rate)
 
@@ -650,7 +671,7 @@ def main() -> None:
 
         other_audio = load_mono_waveform(current_audio_path, sample_rate)
         other_output_path = output_dir / f"{OTHER_CHANNEL.slug}.wav"
-        save_wav(other_output_path, other_audio, sample_rate, normalize=True)
+        save_public_wav(other_output_path, other_audio, sample_rate)
         append_manifest_channel(manifest_channels, OTHER_CHANNEL, other_audio, sample_rate)
         del other_audio
         clear_device_cache(device)
